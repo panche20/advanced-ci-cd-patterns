@@ -1,0 +1,10 @@
+.git
+.github
+kubernetes/
+scripts/
+tests/
+feature-flags/
+*.md
+.env
+__pycache__/
+*.pyc

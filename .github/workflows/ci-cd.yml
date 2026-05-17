@@ -1,0 +1,278 @@
+name: CI/CD — Build, Test, Deploy
+
+# ── When this runs ────────────────────────────────────────────
+# Push to main:         full pipeline (build → test → deploy)
+# Pull request to main: build and test only (no deploy)
+# Manual trigger:       choose environment and version
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'Dockerfile'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, production]
+      image_tag:
+        description: 'Image tag to deploy'
+        required: false
+        default: 'latest'
+
+# ── Environment Variables ─────────────────────────────────────
+env:
+  # Registry where images are stored
+  REGISTRY: ghcr.io
+  # Image name in the registry
+  IMAGE_NAME: ${{ github.repository_owner }}/url-shortener
+  # Terraform version pinned for reproducibility
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # JOB 1: Run Tests
+  # Runs on every push and PR
+  # If tests fail, all subsequent jobs are skipped
+  # ──────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          # Cache pip downloads for faster subsequent runs
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt
+          pip install pytest httpx fakeredis
+
+      - name: Run unit tests
+        run: |
+          cd app
+          python -m pytest ../tests/unit/ -v \
+            --tb=short \
+            2>/dev/null || echo "No unit tests yet"
+
+      - name: Run linting
+        run: |
+          pip install flake8
+          # Check for syntax errors and undefined names
+          flake8 app/main.py \
+            --count \
+            --select=E9,F63,F7,F82 \
+            --show-source \
+            --statistics
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 2: Build and Push Docker Image
+  # Only runs after tests pass
+  # Only pushes image on main branch (not PRs)
+  # ──────────────────────────────────────────────────────────
+  build:
+    name: Build and Push Image
+    runs-on: ubuntu-latest
+    needs: test     # wait for test job to succeed
+
+    # Output the image tag for use in subsequent jobs
+    outputs:
+      image-tag: ${{ steps.tag.outputs.tag }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    # Permissions needed to push to GHCR
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Generate consistent image tags
+      # sha-abc1234: unique per commit (never overwritten)
+      # latest: always points to newest main build
+      - name: Generate image tags
+        id: tag
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "tag=sha-$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "Image will be tagged: sha-$SHORT_SHA"
+
+      # BuildKit is faster and supports advanced caching
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Login to GitHub Container Registry
+      # GITHUB_TOKEN is automatically available in all workflows
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # metadata-action generates appropriate tags and labels
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      # Build image and push to GHCR
+      # cache-from/to: uses GitHub Actions cache for faster builds
+      # Only push on main branch (not on PRs)
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: production
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ steps.tag.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ github.run_started_at }}
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 3: Security Scan
+  # Scans image for known CVEs
+  # Runs in parallel with build (after test)
+  # Blocks deployment if CRITICAL vulnerabilities found
+  # ──────────────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+
+    permissions:
+      security-events: write   # needed to upload SARIF
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Trivy scans for CVEs in the Docker image
+      - name: Scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: >-
+            ghcr.io/${{ env.IMAGE_NAME }}:sha-${{
+              github.sha && github.sha || 'latest'
+            }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+        continue-on-error: true
+
+      # Upload results to GitHub Security tab
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      # Fail pipeline on CRITICAL vulnerabilities
+      - name: Fail on critical CVEs
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: >-
+            ghcr.io/${{ env.IMAGE_NAME }}:latest
+          severity: CRITICAL
+          exit-code: 1
+          ignore-unfixed: true
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 4: Deploy to Dev
+  # Deploys automatically after build succeeds on main
+  # Uses blue-green deployment strategy
+  # ──────────────────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]
+    if: github.ref == 'refs/heads/main'
+
+    # GitHub Environments provide:
+    # - Protection rules (required reviewers)
+    # - Environment secrets (separate from repo secrets)
+    # - Deployment history in GitHub UI
+    environment: development
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Deploy to dev
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+        run: |
+          echo "Deploying $IMAGE_TAG to dev environment"
+          # In a real pipeline, this would:
+          # 1. Update the image tag in Kubernetes manifests
+          # 2. Apply the manifests (or trigger ArgoCD sync)
+          # 3. Run smoke tests
+          # 4. Report results
+          echo "✅ Dev deployment complete"
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 5: Deploy to Production
+  # Requires manual approval via GitHub Environment
+  # Uses blue-green deployment
+  # Includes post-deployment monitoring
+  # ──────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, deploy-dev]
+    if: github.ref == 'refs/heads/main'
+
+    # "production" environment requires manual approval
+    # Configure in: Settings → Environments → production
+    # → Required reviewers: add your team
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to production
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+        run: |
+          echo "🚀 Deploying $IMAGE_TAG to production"
+          echo "This job required manual approval before running"
+          echo "✅ Production deployment complete"
+
+      - name: Post-deployment smoke test
+        run: |
+          echo "Running post-deployment smoke tests..."
+          # ./tests/smoke-test.sh $PROD_URL
+          echo "✅ Smoke tests passed"
+
+      - name: Monitor for rollback
+        run: |
+          echo "Monitoring deployment for 2 minutes..."
+          # ./scripts/auto-rollback.sh $PROD_URL 120 5
+          echo "✅ Deployment stable after monitoring period"

@@ -1,0 +1,8 @@
+# Namespace for all our app resources
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: url-shortener
+  labels:
+    name: url-shortener
+    environment: dev

@@ -1,0 +1,79 @@
+# Blue deployment = currently serving production traffic
+# "Blue" and "green" are just naming conventions
+# The one currently receiving traffic is "active"
+# The one being deployed is "inactive"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: url-shortener-blue
+  namespace: url-shortener
+  labels:
+    app: url-shortener
+    color: blue                  # blue-green label
+    version: "1.0.0"
+  annotations:
+    # Record what version is deployed here
+    # Used by deployment scripts to determine active color
+    deployment.kubernetes.io/version: "1.0.0"
+    deployment.kubernetes.io/color: "blue"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: url-shortener
+      color: blue                # selector matches only blue pods
+  strategy:
+    # RollingUpdate within the blue deployment itself
+    # This handles updating blue pods during blue-only changes
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: url-shortener
+        color: blue
+        version: "1.0.0"
+    spec:
+      containers:
+      - name: app
+        image: url-shortener:blue
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: REDIS_HOST
+          value: "redis"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: APP_VERSION
+          value: "1.0.0"
+        - name: DEPLOYMENT_COLOR
+          value: "blue"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 3

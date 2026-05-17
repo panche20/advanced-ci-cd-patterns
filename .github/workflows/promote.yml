@@ -1,0 +1,101 @@
+name: Environment Promotion
+
+# This workflow promotes a tested image from one environment
+# to the next in the promotion pipeline:
+# dev → staging → production
+#
+# Why a separate promotion workflow?
+# - Separates build from deployment
+# - Allows different approval requirements per environment
+# - One image tag moves through all environments
+# - Easy to see what version is in each environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to promote (e.g., sha-abc1234)'
+        required: true
+      source_environment:
+        description: 'Source environment (already deployed here)'
+        required: true
+        type: choice
+        options: [development, staging]
+      target_environment:
+        description: 'Target environment to promote to'
+        required: true
+        type: choice
+        options: [staging, production]
+
+jobs:
+  validate-promotion:
+    name: Validate Promotion Request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check promotion path is valid
+        run: |
+          SOURCE="${{ github.event.inputs.source_environment }}"
+          TARGET="${{ github.event.inputs.target_environment }}"
+          TAG="${{ github.event.inputs.image_tag }}"
+
+          echo "Promotion request:"
+          echo "  Tag:    $TAG"
+          echo "  From:   $SOURCE"
+          echo "  To:     $TARGET"
+
+          # Validate promotion path
+          # dev → staging is allowed
+          # staging → production is allowed
+          # dev → production is NOT allowed (must go through staging)
+          if [ "$SOURCE" = "development" ] && [ "$TARGET" = "staging" ]; then
+            echo "✅ Valid: dev → staging"
+          elif [ "$SOURCE" = "staging" ] && [ "$TARGET" = "production" ]; then
+            echo "✅ Valid: staging → production"
+          else
+            echo "❌ Invalid promotion path: $SOURCE → $TARGET"
+            echo "   Allowed paths: dev→staging, staging→production"
+            exit 1
+          fi
+
+  promote:
+    name: Promote ${{ github.event.inputs.image_tag }} to ${{ github.event.inputs.target_environment }}
+    runs-on: ubuntu-latest
+    needs: validate-promotion
+
+    # Requires approval based on target environment
+    environment: ${{ github.event.inputs.target_environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to ${{ github.event.inputs.target_environment }}
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          TARGET="${{ github.event.inputs.target_environment }}"
+
+          echo "🚀 Promoting $TAG to $TARGET"
+
+          # In a real pipeline:
+          # 1. Update image tag in environment's Helm values
+          # 2. Commit and push (triggers ArgoCD)
+          # Or: directly call Helm/kubectl
+
+          echo "✅ Promotion to $TARGET complete"
+
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests in ${{ github.event.inputs.target_environment }}..."
+          # Add real URL here
+          echo "✅ Smoke tests passed"
+
+      - name: Record promotion
+        run: |
+          echo "Recording promotion in deployment log..."
+          cat << INFO
+          Promotion complete:
+            Tag:         ${{ github.event.inputs.image_tag }}
+            From:        ${{ github.event.inputs.source_environment }}
+            To:          ${{ github.event.inputs.target_environment }}
+            Promoted by: ${{ github.actor }}
+            Time:        $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          INFO

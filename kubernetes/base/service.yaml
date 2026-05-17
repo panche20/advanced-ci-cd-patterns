@@ -1,0 +1,80 @@
+# ── Production Service (Active) ───────────────────────────────
+# This service routes traffic to the ACTIVE deployment.
+# Blue-green switch = change the selector label (color: blue/green)
+#
+# This is the KEY to blue-green:
+# One service, one endpoint, one URL for users.
+# Just the selector changes to point to different pods.
+#
+# Before switch: selector.color = blue → all traffic to blue pods
+# After switch:  selector.color = green → all traffic to green pods
+# Switch is instantaneous — no downtime
+apiVersion: v1
+kind: Service
+metadata:
+  name: url-shortener
+  namespace: url-shortener
+  labels:
+    app: url-shortener
+  annotations:
+    # Record which color is currently active
+    # Used by scripts to determine current state
+    service.kubernetes.io/active-color: "blue"
+spec:
+  selector:
+    app: url-shortener
+    color: blue          # ← THIS IS WHAT CHANGES DURING SWITCH
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+  type: ClusterIP
+---
+# ── Test Service (Inactive) ───────────────────────────────────
+# This service points directly to the INACTIVE deployment.
+# Used to test green before switching production traffic.
+#
+# In blue-green deployment:
+# 1. Deploy green (no traffic)
+# 2. Run smoke tests against url-shortener-test (hits green)
+# 3. If tests pass: switch url-shortener to point at green
+# 4. url-shortener-test now hits blue (old version)
+#
+# This lets you test the new version without affecting users.
+apiVersion: v1
+kind: Service
+metadata:
+  name: url-shortener-test
+  namespace: url-shortener
+  labels:
+    app: url-shortener
+    purpose: testing
+  annotations:
+    service.kubernetes.io/inactive-color: "green"
+spec:
+  selector:
+    app: url-shortener
+    color: green         # always points to the inactive color
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+  type: ClusterIP
+---
+# ── External Access (NodePort) ────────────────────────────────
+# Exposes the production service externally for testing
+apiVersion: v1
+kind: Service
+metadata:
+  name: url-shortener-external
+  namespace: url-shortener
+spec:
+  selector:
+    app: url-shortener
+    color: blue          # starts pointing to blue
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+    nodePort: 30080
+  type: NodePort

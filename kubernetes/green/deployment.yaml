@@ -1,0 +1,74 @@
+# Green deployment = new version being deployed
+# Initially gets NO traffic (not selected by active service)
+# After validation: flip the service selector to green
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: url-shortener-green
+  namespace: url-shortener
+  labels:
+    app: url-shortener
+    color: green
+    version: "1.1.0"
+  annotations:
+    deployment.kubernetes.io/version: "1.1.0"
+    deployment.kubernetes.io/color: "green"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: url-shortener
+      color: green
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: url-shortener
+        color: green
+        version: "1.1.0"
+    spec:
+      containers:
+      - name: app
+        image: url-shortener:green
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: REDIS_HOST
+          value: "redis"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: APP_VERSION
+          value: "1.1.0"
+        - name: DEPLOYMENT_COLOR
+          value: "green"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 3
